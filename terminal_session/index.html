@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Persistent Terminal Session</title>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/node_modules/xterm/css/xterm.css" />
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: "Courier New", Courier, monospace;
+        }
+
+        .full-display {
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #session-controls {
+            background: #1a1a1a;
+            color: #00ff00;
+            padding: 8px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        #session-controls input {
+            background: #000;
+            color: #00ff00;
+            border: 1px solid #333;
+            padding: 4px 8px;
+            font-family: monospace;
+        }
+
+        #session-controls button {
+            background: #333;
+            color: #00ff00;
+            border: 1px solid #555;
+            padding: 4px 12px;
+            cursor: pointer;
+            font-family: monospace;
+        }
+
+        #session-controls button:hover {
+            background: #555;
+        }
+
+        #session-status {
+            font-weight: bold;
+        }
+
+        #terminal-container {
+            flex: 1;
+            padding: 5px;
+            overflow: hidden;
+        }
+
+        .status-connected { color: #00ff00 !important; }
+        .status-disconnected { color: #ff0000 !important; }
+        .status-connecting { color: #ffff00 !important; }
+    </style>
+</head>
+<body class="full-display">
+    <div id="session-controls">
+        <span>Session ID:</span>
+        <input type="text" id="session-id" placeholder="Enter session ID or leave blank for default">
+        <button onclick="joinSession()">Join Session</button>
+        <button onclick="createNewSession()">New Session</button>
+        <button onclick="listSessions()">List Sessions</button>
+        <span id="session-status" class="status-disconnected">Disconnected</span>
+        <span id="connection-info"></span>
+    </div>
+    <div id="terminal-container"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/node_modules/xterm/lib/xterm.js"></script>
+    <script src="/node_modules/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+
+    <script>
+        // Global variables
+        var socket = null;
+        var term = null;
+        var fitAddon = null;
+        var currentSessionId = null;
+
+        /**
+         * Initializes the xterm.js terminal and the fit addon.
+         */
+        function initTerminal() {
+            if (term) return; // Already initialized
+
+            const terminalContainer = document.getElementById('terminal-container');
+            term = new Terminal({
+                cursorBlink: true,
+                fontFamily: 'Consolas, "Courier New", monospace',
+                fontSize: 14,
+                theme: {
+                    background: '#000000',
+                    foreground: '#00ff00',
+                    cursor: '#00ff00',
+                }
+            });
+
+            fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            term.open(terminalContainer);
+            fitAddon.fit();
+
+            term.onData(data => {
+                if (socket && socket.connected) {
+                    socket.emit('input', data);
+                }
+            });
+
+            window.addEventListener('resize', () => {
+                fitAddon.fit();
+            });
+
+            // Expose for debugging
+            window.term = term;
+        }
+
+        /**
+         * Initializes the Socket.IO connection and sets up event handlers.
+         */
+        function initializeSocket() {
+            if (socket) {
+                socket.disconnect();
+            }
+
+            socket = io({
+                transports: ['polling', 'websocket'], // Allow both transports for reliability
+                reconnection: true,
+                reconnectionAttempts: 5,
+                reconnectionDelay: 2000,
+            });
+
+            setupSocketHandlers();
+        }
+        
+        /**
+         * Gets the session ID from the URL query parameter.
+         */
+        function getSessionIdFromUrl() {
+            const urlParams = new URLSearchParams(window.location.search);
+            return urlParams.get('session') || 'default';
+        }
+
+        /**
+         * Joins a session by its ID.
+         */
+        function joinSessionById(sessionId) {
+            if (!sessionId) {
+                console.error("Session ID cannot be empty.");
+                return;
+            }
+
+            if (currentSessionId === sessionId && socket && socket.connected) {
+                term.writeln(`\r\n\x1b[33mAlready in session: ${sessionId}\x1b[0m`);
+                return;
+            }
+
+            currentSessionId = sessionId;
+            document.getElementById('session-id').value = sessionId;
+            updateStatus('Joining...', 'connecting');
+
+            if (socket && socket.connected) {
+                term.writeln(`\r\n\x1b[36mJoining session: ${sessionId}...\x1b[0m`);
+                socket.emit('join-session', { sessionId });
+            } else {
+                term.writeln(`\r\n\x1b[31mNot connected. Attempting to connect first...\x1b[0m`);
+                initializeSocket(); // It will auto-join on 'connect' event
+            }
+        }
+        
+        /**
+         * Public function called by the "Join Session" button.
+         */
+        function joinSession() {
+            const sessionId = document.getElementById('session-id').value.trim();
+            joinSessionById(sessionId || 'default');
+        }
+
+        /**
+         * Public function to create a new session.
+         */
+        function createNewSession() {
+            const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+            joinSessionById(newSessionId);
+        }
+
+        /**
+         * Public function to list active sessions.
+         */
+        async function listSessions() {
+            try {
+                const response = await fetch('/api/sessions');
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch sessions: ${response.statusText}`);
+                }
+                const sessions = await response.json();
+                
+                term.writeln('\r\n\x1b[1;34m--- Active Sessions ---');
+                if (sessions.length === 0) {
+                    term.writeln('\x1b[33m  No active sessions found.\x1b[0m');
+                } else {
+                    sessions.forEach(s => {
+                        const age = Math.round((Date.now() - s.createdAt) / 1000);
+                        const activity = Math.round((Date.now() - s.lastActivity) / 1000);
+                        const status = s.isActive ? '\x1b[32mACTIVE\x1b[0m' : '\x1b[31mINACTIVE\x1b[0m';
+                        term.writeln(`  ID: ${s.id} | Status: ${status} | Clients: ${s.clientCount} | Age: ${age}s | Last Activity: ${activity}s ago`);
+                    });
+                }
+                term.writeln('\x1b[1;34m-----------------------\x1b[0m');
+            } catch (error) {
+                term.writeln(`\r\n\x1b[31mError listing sessions: ${error.message}\x1b[0m`);
+            }
+        }
+
+        /**
+         * Updates the UI status message.
+         */
+        function updateStatus(message, statusClass) {
+            const statusEl = document.getElementById('session-status');
+            statusEl.textContent = message;
+            statusEl.className = `status-${statusClass}`;
+            document.getElementById('connection-info').textContent = currentSessionId ? `(${currentSessionId})` : '';
+        }
+
+        /**
+         * Sets up all Socket.IO event listeners.
+         */
+        function setupSocketHandlers() {
+            socket.on('connect', () => {
+                console.log('Socket.IO connected.');
+                updateStatus('Connected', 'connected');
+                const sessionIdToJoin = currentSessionId || getSessionIdFromUrl();
+                joinSessionById(sessionIdToJoin);
+            });
+
+            socket.on('disconnect', (reason) => {
+                console.log(`Socket.IO disconnected: ${reason}`);
+                updateStatus('Disconnected', 'disconnected');
+                if (term) {
+                    term.writeln('\r\n\x1b[31mConnection to server lost. Attempting to reconnect...\x1b[0m');
+                }
+            });
+
+            socket.on('session-joined', (data) => {
+                currentSessionId = data.sessionId;
+                updateStatus('Session Active', 'connected');
+                term.writeln(`\r\n\x1b[32m✓ Successfully joined session: ${data.sessionId}\x1b[0m`);
+                term.writeln(`\x1b[90m  Session created at: ${new Date(data.createdAt).toLocaleString()}\x1b[0m`);
+                
+                const { cols, rows } = term;
+                socket.emit('resize', { cols, rows });
+
+                // Update URL without page refresh
+                const newUrl = new URL(window.location);
+                newUrl.searchParams.set('session', data.sessionId);
+                window.history.replaceState({ path: newUrl.href }, '', newUrl.href);
+            });
+
+            socket.on('terminal-output-stdout', (msg) => {
+                term.write(msg.message);
+            });
+
+            socket.on('terminal-output-stderr', (msg) => {
+                // Write stderr in a different color for visibility
+                term.write(`\x1b[31m${msg.message}\x1b[0m`);
+            });
+            
+            socket.on('terminal-exit-code', (msg) => {
+                const code = msg.message;
+                const exitMessage = code === 1337 ? 'Session closed by server.' : `Process exited with code: ${code}`;
+                term.writeln(`\r\n\x1b[33m${exitMessage}\x1b[0m`);
+            });
+
+            socket.on('error', (error) => {
+                console.error('Socket error:', error);
+                term.writeln(`\r\n\x1b[31mSocket Error: ${error}\x1b[0m`);
+            });
+
+            socket.on('connect_error', (err) => {
+                console.error('Connection error:', err);
+                updateStatus('Connection Error', 'disconnected');
+                term.writeln(`\r\n\x1b[31mConnection failed: ${err.message}\x1b[0m`);
+            });
+        }
+        
+        /**
+         * Main initialization function on document load.
+         */
+        function main() {
+            initTerminal();
+            term.writeln('Welcome to the Persistent Terminal!');
+            
+            const initialSessionId = getSessionIdFromUrl();
+            document.getElementById('session-id').value = initialSessionId;
+            currentSessionId = initialSessionId;
+            
+            initializeSocket();
+
+            document.getElementById('session-id').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    joinSession();
+                }
+            });
+        }
+        
+        // Expose public functions to the window object
+        window.joinSession = joinSession;
+        window.createNewSession = createNewSession;
+        window.listSessions = listSessions;
+
+        // Run main initialization
+        document.addEventListener('DOMContentLoaded', main);
+    </script>
+</body>
+</html>
+
