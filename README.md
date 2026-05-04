@@ -11,9 +11,14 @@ Both processes share the **`/workspace`** volume. The terminal defaults its shel
 
 Create the shared Docker network once if needed: `docker network create generative-cybersecurity-network`.
 
+**NYUCTF data on the host:** clone or copy the dataset repo into a directory on your machine, then point compose at it (defaults to `./nyuctf-data` next to this file):
+
 ```bash
+export NYUCTF_HOST_PATH=/absolute/path/to/your/nyuctf-v20250206   # optional; default ./nyuctf-data
 docker compose up --build
 ```
+
+That path is mounted at **`/root/.nyuctf/v20250206`** inside the container so the `nyuctf` package and materialize see the same tree as on the host.
 
 - Challenge API: `http://localhost:8080` (maps container port 80).
 - Terminal UI / API: `http://localhost:3000`.

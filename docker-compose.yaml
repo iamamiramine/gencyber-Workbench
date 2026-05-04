@@ -8,6 +8,8 @@ services:
       - "3000:3000"
     volumes:
       - workbench_workspace:/workspace
+      # NYUCTF dataset on host → same path the `nyuctf` package uses in-container (override with NYUCTF_HOST_PATH)
+      - ${NYUCTF_HOST_PATH:-./nyuctf-data}:/root/.nyuctf/:rw
     environment:
       CHALLENGE_ROOT: /workspace/challenges
       PORT: "3000"

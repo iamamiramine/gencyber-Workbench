@@ -23,7 +23,12 @@ RUN pip3 install --no-cache-dir -r /app/challenge_api/requirements.txt
 
 COPY challenge_api/src /app/challenge_api/src
 COPY terminal_session /app/terminal_session
-RUN cd /app/terminal_session && npm ci --omit=dev
+# node-pty native addon: prebuilds may be missing; node-gyp needs make/g++ (see gencyber-dev terminal-session on node:18)
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+  && cd /app/terminal_session && npm ci --omit=dev \
+  && apt-get purge -y build-essential \
+  && apt-get autoremove -y \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY supervisord.conf /etc/supervisor/conf.d/workbench.conf
 

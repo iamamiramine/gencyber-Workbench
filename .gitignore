@@ -142,3 +142,6 @@ cython_debug/
 
 models/*
 data/*
+
+# Node (terminal_session)
+terminal_session/node_modules/
