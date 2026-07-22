@@ -82,4 +82,44 @@ class MaterializeRequest(ChallengeRequest):
         default=None,
         description="Optional path under CHALLENGE_ROOT; default benchmark/split/challenge_id",
     )
+    force: bool = Field(
+        default=False,
+        description="Re-copy files even if this challenge was already materialized",
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Agent run/session id to bind this materialized challenge to. When set, the "
+            "workbench records a session→challenge binding so it can later validate a "
+            "submitted flag for this session via /validate-submission, without the agent "
+            "ever holding the ground-truth flag or challenge identity."
+        ),
+    )
+
+
+class ValidateSubmissionRequest(BaseModel):
+    """Validate a submitted flag against the challenge bound to ``session_id``.
+
+    The agent holds no ground-truth flag and no challenge identity; it POSTs the
+    candidate plus its session id, and the workbench (which owns challenge
+    materialization and therefore the ground truth) returns the verdict.
+    """
+
+    session_id: str = Field(description="Agent run/session id used at materialize time")
+    candidate: str = Field(description="The submitted flag to check")
+
+
+class ChallengeServicesRequest(ChallengeRequest):
+    written_root: Optional[str] = Field(
+        default=None,
+        description="Materialized challenge directory (default under CHALLENGE_ROOT)",
+    )
+    project_name: Optional[str] = Field(
+        default=None,
+        description="Docker compose project name (for stop)",
+    )
+
+
+class ResolveFlagRequest(ChallengeRequest):
+    """Server-only ground-truth flag resolution (agent service, not browser UI)."""
 

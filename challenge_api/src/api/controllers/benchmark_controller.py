@@ -6,10 +6,14 @@ from application.benchmark.helpers import benchmark_helper as bh
 from application.benchmark.services.benchmark_service import BenchmarkService
 from domain.models.benchmark.challenge_model import (
     ChallengeRequest,
+    ChallengeServicesRequest,
     MaterializeRequest,
+    ResolveFlagRequest,
     Split,
     TaskRequest,
+    ValidateSubmissionRequest,
 )
+from application.benchmark.services.challenge_runtime_service import ChallengeRuntimeService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -72,10 +76,32 @@ def post_materialize(req: MaterializeRequest) -> Dict[str, Any]:
             split=req.split,
             challenge_id=req.challenge_id,
             relative_path=req.relative_path,
+            force=req.force,
+            session_id=req.session_id,
         )
     except Exception as e:
         logger.exception("Failed to materialize challenge")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/validate-submission")
+def post_validate_submission(req: ValidateSubmissionRequest) -> Dict[str, Any]:
+    """Validate a submitted flag against the challenge bound to ``session_id``.
+
+    Always returns 200 with ``{accepted: bool, reason}`` — an ordinary wrong flag,
+    an unbound session, or a challenge without a ground-truth oracle are all just a
+    ``False`` verdict (not an HTTP error), so the agent can treat the response
+    uniformly as accept/reject.
+    """
+    try:
+        service = BenchmarkService()
+        return service.validate_submission(
+            session_id=req.session_id,
+            candidate=req.candidate,
+        )
+    except Exception as e:
+        logger.exception("Failed to validate submission")
+        return {"accepted": False, "reason": f"validation error: {e}"}
 
 
 @router.post("/challenge/files")
@@ -104,4 +130,55 @@ def get_task_with_challenge(req: TaskRequest) -> Dict[str, Any]:
         )
     except Exception as e:
         logger.exception("Failed to build task payload")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/start-challenge-services")
+def post_start_challenge_services(req: ChallengeServicesRequest) -> Dict[str, Any]:
+    try:
+        runtime = ChallengeRuntimeService()
+        return runtime.start_challenge_services(
+            benchmark=req.benchmark,
+            split=req.split,
+            challenge_id=req.challenge_id,
+            written_root=req.written_root,
+        )
+    except Exception as e:
+        logger.exception("Failed to start challenge services")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/stop-challenge-services")
+def post_stop_challenge_services(req: ChallengeServicesRequest) -> Dict[str, Any]:
+    try:
+        runtime = ChallengeRuntimeService()
+        return runtime.stop_challenge_services(
+            benchmark=req.benchmark,
+            split=req.split,
+            challenge_id=req.challenge_id,
+            written_root=req.written_root,
+            project_name=req.project_name,
+        )
+    except Exception as e:
+        logger.exception("Failed to stop challenge services")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/resolve-flag")
+def post_resolve_flag(req: ResolveFlagRequest) -> Dict[str, Any]:
+    """Ground-truth flag for workflow validation (trusted backend callers only)."""
+    try:
+        service = BenchmarkService()
+        flag = service.resolve_ground_truth_flag(
+            benchmark=req.benchmark,
+            split=req.split,
+            challenge_id=req.challenge_id,
+        )
+        if flag is None:
+            raise HTTPException(status_code=404, detail="Flag not available for this challenge")
+        return {"benchmark": req.benchmark, "split": req.split, "challenge_id": req.challenge_id, "flag": flag}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to resolve flag")
         raise HTTPException(status_code=400, detail=str(e))

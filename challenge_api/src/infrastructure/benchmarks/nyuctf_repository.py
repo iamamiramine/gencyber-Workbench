@@ -1,16 +1,166 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import os
+import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 _SKIP_TOP_FILES = frozenset({"challenge.json"})
-_SKIP_DIR_PARTS = frozenset({".git", "__pycache__", ".venv", "node_modules"})
+# A ``hints`` directory in the NYU CTF tree only ever holds author walkthroughs
+# (solution.md / implementation.md that literally print the flag), so it is skipped
+# wholesale alongside the usual VCS / build-cache dirs.
+_SKIP_DIR_PARTS = frozenset(
+    {".git", "__pycache__", ".venv", "node_modules", "hints"}
+)
 # Avoid provisioning multi-hundred-MB blobs by default (tune via env if needed).
 _MAX_PROVISION_FILE_BYTES = 80 * 1024 * 1024
+
+# Solution / answer-key leak filtering -------------------------------------------------
+#
+# NYU CTF challenge folders ship the author's solution next to the real artifacts:
+# solve scripts (solver.py / solve.py / solution.c / exploit.py), markdown writeups,
+# and plaintext ``flag`` files holding the ground-truth flag. Materializing those lets
+# an agent short-circuit the task by reading the answer instead of recovering it, which
+# silently inflates benchmark success. We drop them at copy time.
+#
+# Matching is generic (conventional file *stems*, never a challenge or file name) and is
+# always overridden by ``challenge.json``'s ``files`` list: anything the challenge
+# explicitly declares as an input is a legitimate artifact and is never dropped — so a
+# rev/crypto binary that embeds the flag by design still reaches the agent.
+_SOLUTION_STEMS = frozenset(
+    {"solution", "solutions", "solve", "solver", "exploit", "writeup", "write-up", "writeups"}
+)
+_FLAG_BASENAMES = frozenset({"flag", "flag.txt"})
+
+
+def _strip_solutions_enabled() -> bool:
+    flag = (os.environ.get("GENCYBER_STRIP_SOLUTIONS", "1") or "").strip().lower()
+    return flag not in ("0", "false", "no", "off")
+
+
+def _load_declared_files_and_flag(chal_dir: Path) -> Tuple[Set[str], str]:
+    """Return (declared input rel-paths, ground-truth flag) from ``challenge.json``.
+
+    The declared ``files`` list is the authoritative allow-list of challenge inputs; we
+    use it to protect legitimate artifacts from the solution filter. Best-effort: a
+    missing/invalid manifest yields an empty allow-list and no flag.
+    """
+    declared: Set[str] = set()
+    gt_flag = ""
+    cj = chal_dir / "challenge.json"
+    try:
+        data = json.loads(cj.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return declared, gt_flag
+    if isinstance(data, dict):
+        gt_flag = str(data.get("flag") or "").strip()
+        for f in data.get("files", []) or []:
+            declared.add(os.path.normpath(str(f).lstrip("./")).replace("\\", "/"))
+    return declared, gt_flag
+
+
+def _is_solution_leak(
+    rel: Path,
+    chal_dir: Path,
+    *,
+    declared: Set[str],
+    gt_flag: str,
+) -> bool:
+    """True if ``rel`` is solution / answer-key material that must not be materialized.
+
+    A file explicitly declared in ``challenge.json`` is always treated as a legitimate
+    input (never a leak). Otherwise a file is a leak when its stem is a conventional
+    solution name, or when it is a plaintext ``flag``/``flag.txt`` whose contents carry
+    the real ground-truth flag (placeholder flag files used by local servers are kept).
+    """
+    if not _strip_solutions_enabled():
+        return False
+    if rel.as_posix() in declared:
+        return False  # declared challenge input — always legitimate
+    name = rel.name.lower()
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    if stem in _SOLUTION_STEMS:
+        return True
+    if name in _FLAG_BASENAMES and gt_flag:
+        try:
+            content = (chal_dir / rel).read_bytes()
+        except OSError:
+            content = b""
+        if gt_flag.encode("utf-8", "ignore") in content:
+            return True
+    return False
+
+
+# The docker-compose filenames the workbench understands. NYU CTF server challenges
+# reference a prebuilt ``image:`` (verified: no dev-split compose uses ``build:`` or a
+# local bind mount), so the compose YAML is all that is needed to boot the server — the
+# build tree (Dockerfile / src) is never required on disk and, crucially, never reaches
+# the agent workspace.
+_COMPOSE_FILENAMES: Tuple[str, ...] = (
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+)
+
+
+def materialize_allowlisted_files(
+    chal_dir: Path,
+    target_base: Path,
+    *,
+    compose_filenames: Tuple[str, ...] = _COMPOSE_FILENAMES,
+) -> int:
+    """Copy ONLY the agent-facing challenge inputs from ``chal_dir`` into ``target_base``.
+
+    NYU CTF's ``challenge.json['files']`` is the *authoritative allow-list* of what the
+    solver is meant to receive. Everything else in the on-disk challenge folder is
+    server-build / author infrastructure that must never reach the agent:
+
+      * ``README.md`` — ships the flag and/or a full solution walkthrough in plaintext,
+      * ``Dockerfile`` / ``src/`` — bake the flag into the prebuilt server image,
+      * ``mysql-setup.sh`` and similar seeds — embed the flag in the DB,
+      * author ``solve``/``solver``/``test_solver``/writeup files.
+
+    Copying the whole tree (the previous behaviour) leaked the flag through all of the
+    above. Here we copy exactly the declared files (verbatim — a rev/crypto binary that
+    embeds the flag by design is a legitimate input and still reaches the agent) plus the
+    docker-compose file, which the workbench needs to start the prebuilt server and which
+    carries no flag. Returns the number of files copied.
+    """
+    if chal_dir is None or not chal_dir.is_dir():
+        return 0
+    declared, _gt_flag = _load_declared_files_and_flag(chal_dir)
+
+    if target_base.exists():
+        shutil.rmtree(target_base)
+    target_base.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    # 1) Declared challenge inputs (the allow-list), preserving any sub-directory layout.
+    for rel in sorted(declared):
+        src = chal_dir / rel
+        if not src.is_file():
+            continue
+        dest = target_base / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        count += 1
+
+    # 2) The docker-compose file so start-challenge-services can boot the prebuilt
+    #    ``image:`` server. No build context is copied because none is needed.
+    for name in compose_filenames:
+        src = chal_dir / name
+        if src.is_file():
+            shutil.copy2(src, target_base / name)
+            count += 1
+            break
+
+    return count
 
 
 Split = Literal["development", "test"]
@@ -151,10 +301,9 @@ class NYUCTFRepository:
         Recursively package the challenge directory for the sandbox workspace so
         ``docker-compose`` bind mounts and relative paths match the NYU layout.
 
-        Omits ``challenge.json`` (ground-truth flag). Skips bulky / dev dirs.
+        Omits ``challenge.json`` (ground-truth flag) and author solution / answer-key
+        files (see :func:`_is_solution_leak`). Skips bulky / dev dirs.
         """
-        import os
-
         limit = max_bytes_per_file
         try:
             limit = int(os.environ.get("GENCYBER_PROVISION_MAX_FILE_BYTES", str(max_bytes_per_file)))
@@ -164,6 +313,8 @@ class NYUCTFRepository:
         chal_dir = self.resolve_challenge_directory(split, challenge_id)
         if chal_dir is None or not chal_dir.is_dir():
             return []
+
+        declared, gt_flag = _load_declared_files_and_flag(chal_dir)
 
         out: List[Dict[str, Any]] = []
         try:
@@ -182,6 +333,9 @@ class NYUCTFRepository:
             if any(p in _SKIP_DIR_PARTS for p in parts):
                 continue
             if rel.name in _SKIP_TOP_FILES:
+                continue
+            if _is_solution_leak(rel, chal_dir, declared=declared, gt_flag=gt_flag):
+                logger.info("Omitting solution/answer-key file from provision: %s", rel.as_posix())
                 continue
             rel_posix = rel.as_posix()
             try:
@@ -204,3 +358,23 @@ class NYUCTFRepository:
                 "base64": base64.b64encode(content).decode("ascii"),
             })
         return out
+
+    def copy_challenge_tree_to_workspace(
+        self,
+        split: Split,
+        challenge_id: str,
+        target_base: Path,
+    ) -> int:
+        """
+        Fast path: materialize the agent-facing challenge inputs into ``target_base``
+        without base64 round-tripping through Python.
+
+        Copies ONLY the ``challenge.json`` allow-list (declared ``files``) plus the
+        docker-compose file — never the whole on-disk tree, which leaks the flag through
+        README/Dockerfile/setup-script/source files. See
+        :func:`materialize_allowlisted_files` for the rationale.
+        """
+        chal_dir = self.resolve_challenge_directory(split, challenge_id)
+        return materialize_allowlisted_files(
+            chal_dir, target_base, compose_filenames=self._COMPOSE_FILENAMES
+        )

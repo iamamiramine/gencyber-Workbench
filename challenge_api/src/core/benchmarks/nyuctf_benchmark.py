@@ -80,10 +80,14 @@ class NYUCTFBenchmark(BaseBenchmark):
         return self.repo.read_challenge_files_b64(split=split, challenge_id=challenge_id)
 
     def provision_files_b64(self, split: Split, challenge_id: str) -> List[Dict[str, Any]]:
-        """Full challenge tree for sandbox + compose; falls back to manifest-only if needed."""
-        full = self.repo.read_full_challenge_tree_for_provision(split=split, challenge_id=challenge_id)
-        if full:
-            return full
+        """Agent-facing inputs only: the ``challenge.json`` manifest files (allow-list).
+
+        Previously this returned the *full* challenge tree, which leaked the flag through
+        README/Dockerfile/setup-script/source files. NYU CTF servers run from a prebuilt
+        ``image:`` (no ``build:`` context on disk), so only the declared inputs are needed
+        by the agent; the compose file for server start-up is materialized separately by
+        :meth:`NYUCTFRepository.copy_challenge_tree_to_workspace`.
+        """
         return self.challenge_files_b64(split=split, challenge_id=challenge_id)
 
     def challenge_docker_compose(self, split: Split, challenge_id: str) -> Optional[str]:

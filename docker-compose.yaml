@@ -10,9 +10,12 @@ services:
       - workbench_workspace:/workspace
       # NYUCTF dataset on host → same path the `nyuctf` package uses in-container (override with NYUCTF_HOST_PATH)
       - ${NYUCTF_HOST_PATH:-./nyuctf-data}:/root/.nyuctf/:rw
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       CHALLENGE_ROOT: /workspace/challenges
       PORT: "3000"
+      GENCYBER_SANDBOX_PROFILE: kali-ctf
+      GENCYBER_DOCKER_NETWORK: generative-cybersecurity-network
     networks:
       - generative-cybersecurity-network
 
