@@ -8,11 +8,13 @@ from typing import Any, Dict, List, Literal, Optional, Type
 
 from core.benchmarks.base_benchmark import BaseBenchmark
 from core.benchmarks.nyuctf_benchmark import NYUCTFBenchmark
+from core.benchmarks.otw_benchmark import OTWBenchmark
 
-Split = Literal["development", "test"]
+Split = Literal["development", "test", "bandit", "krypton"]
 
 BENCHMARK_REGISTRY: Dict[str, Type[BaseBenchmark]] = {
     "nyuctf": NYUCTFBenchmark,
+    "otw": OTWBenchmark,
 }
 
 _BENCHMARK_ALIASES = {"nyu_ctf": "nyuctf", "nyu-ctf": "nyuctf"}

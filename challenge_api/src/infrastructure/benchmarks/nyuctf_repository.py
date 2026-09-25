@@ -109,6 +109,18 @@ _COMPOSE_FILENAMES: Tuple[str, ...] = (
 )
 
 
+def _redact_flag_in_text(text: str, gt_flag: str) -> str:
+    """Replace the plaintext ground-truth flag with ``${GENCYBER_FLAG}`` so an agent
+    reading a materialized docker-compose can't simply grep it out of its own workspace.
+    Some NYU server challenges embed the flag as a plaintext ``FLAG=`` env var in the
+    compose; the real value is re-injected into the service container's environment only
+    at ``docker compose up`` time (see ChallengeRuntimeService.start_challenge_services).
+    """
+    if not gt_flag:
+        return text
+    return text.replace(gt_flag, "${GENCYBER_FLAG}")
+
+
 def materialize_allowlisted_files(
     chal_dir: Path,
     target_base: Path,
@@ -152,11 +164,20 @@ def materialize_allowlisted_files(
         count += 1
 
     # 2) The docker-compose file so start-challenge-services can boot the prebuilt
-    #    ``image:`` server. No build context is copied because none is needed.
+    #    ``image:`` server. No build context is copied because none is needed. Some NYU
+    #    server challenges embed the ground-truth flag as a plaintext ``FLAG=`` env var in
+    #    this compose, so redact it to ``${GENCYBER_FLAG}`` before it reaches the agent
+    #    workspace; the real value is injected into the container env at launch time.
     for name in compose_filenames:
         src = chal_dir / name
         if src.is_file():
-            shutil.copy2(src, target_base / name)
+            try:
+                text = src.read_text(encoding="utf-8", errors="replace")
+                (target_base / name).write_text(
+                    _redact_flag_in_text(text, _gt_flag), encoding="utf-8"
+                )
+            except OSError:
+                shutil.copy2(src, target_base / name)
             count += 1
             break
 

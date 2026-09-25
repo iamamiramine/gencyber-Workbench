@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 from domain.models.benchmark.challenge_model import Challenge
 
 
-Split = Literal["development", "test"]
+Split = Literal["development", "test", "bandit", "krypton"]
 
 
 class BaseBenchmark(ABC):

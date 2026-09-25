@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 
 
 ServerType = Literal["nc", "web"]
-Split = Literal["development", "test"]
+# "development"/"test" = NYU CTF splits; "bandit"/"krypton" = OverTheWire games.
+Split = Literal["development", "test", "bandit", "krypton"]
 
 
 class Server(BaseModel):

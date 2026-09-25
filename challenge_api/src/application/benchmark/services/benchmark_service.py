@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import shutil
+import signal
+import subprocess
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -91,29 +93,97 @@ def _reset_workspace_scratch() -> None:
     )
 
 
+def _reset_external_scratch() -> None:
+    """Delete prior-run agent scratch that lives OUTSIDE the /workspace volume, and
+    reap processes the previous challenge left running.
+
+    ``_reset_workspace_scratch`` wipes the workspace root, but the agent's shell can
+    write anywhere in the container. ``/tmp`` in particular survives every challenge
+    and is never cleared, which is how ``2017q-rev-prophecy`` came to read
+    ``/tmp/final_flag.txt`` — a file written by the agent that solved
+    ``2018q-for-simple_recovery`` — and submit that flag sixteen times. A reset that
+    stops at the workspace boundary is not a reset.
+
+    Two surfaces are handled here:
+
+    * **Scratch directories.** Everything under ``/tmp`` and ``/var/tmp`` is removed.
+      These hold no challenge inputs; materialisation writes only under
+      ``CHALLENGE_ROOT``.
+    * **Surviving processes.** CTF binaries and debuggers outlive their challenge:
+      one run left thirteen spinning binaries and two ``gdb`` instances alive for
+      twelve hours, driving host load to 17 on 16 cores and starving the challenge
+      actually being solved. Anything still executing out of the challenge tree or
+      still attached to a debugger is killed.
+
+    Best-effort and non-fatal throughout. Disable with ``GENCYBER_WORKSPACE_RESET=0``,
+    the same switch that governs the workspace reset.
+    """
+    flag = (os.environ.get("GENCYBER_WORKSPACE_RESET", "1") or "").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return
+
+    removed = 0
+    for scratch in ("/tmp", "/var/tmp"):
+        root = Path(scratch)
+        if not root.is_dir():
+            continue
+        for entry in root.iterdir():
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed += 1
+            except OSError as e:  # pragma: no cover - best effort
+                logger.warning("scratch reset could not remove %s: %s", entry, e)
+
+    killed = 0
+    try:
+        challenge_root = str(_challenge_root().resolve())
+        out = subprocess.run(
+            ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=15
+        ).stdout
+        for line in out.splitlines()[1:]:
+            pid, _, args = line.strip().partition(" ")
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            if challenge_root in args or args.strip().startswith(("gdb", "/usr/bin/gdb")):
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    killed += 1
+                except OSError:
+                    pass
+    except Exception as e:  # pragma: no cover - best effort
+        logger.warning("process reap skipped: %s", e)
+
+    logger.info(
+        "Reset external scratch: removed %s entries from /tmp and /var/tmp, "
+        "killed %s leftover process(es)", removed, killed
+    )
+
+
 def _write_session_binding(
     session_id: str,
     *,
     benchmark: str,
     split: str,
     challenge_id: str,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not session_id or not str(session_id).strip():
         return
     sdir = _sessions_dir()
     sdir.mkdir(parents=True, exist_ok=True)
     path = sdir / f"{_safe_session_key(session_id)}.json"
-    path.write_text(
-        json.dumps(
-            {
-                "session_id": str(session_id),
-                "benchmark": benchmark,
-                "split": split,
-                "challenge_id": challenge_id,
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload: Dict[str, Any] = {
+        "session_id": str(session_id),
+        "benchmark": benchmark,
+        "split": split,
+        "challenge_id": challenge_id,
+    }
+    if extra:
+        payload.update(extra)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _read_session_binding(session_id: str) -> Optional[Dict[str, Any]]:
@@ -383,6 +453,10 @@ class BenchmarkService:
             }
 
         benchmark = str(binding.get("benchmark") or "")
+        if benchmark == "otw":
+            # OverTheWire has no ground-truth flag file — the oracle is a live SSH login
+            # into the next account with the candidate password.
+            return self._validate_otw(binding=binding, candidate=candidate)
         split = str(binding.get("split") or "")
         challenge_id = str(binding.get("challenge_id") or "")
         if not (benchmark and split and challenge_id):
@@ -408,6 +482,97 @@ class BenchmarkService:
             return {"accepted": True, "reason": None}
         return {"accepted": False, "reason": "incorrect flag"}
 
+    def _materialize_otw(
+        self, *, split: Split, challenge_id: str, session_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Materialize one OverTheWire level: resolve its (chained) entry password,
+        bind the SSH validation target, and return the agent briefing. A level whose
+        entry password is not yet known (previous level unsolved) comes back ``locked``.
+        """
+        from application.benchmark.services import otw_support as otw
+
+        bench = bh.instantiate_benchmark("otw")
+        lv = bench.get_level(split, challenge_id)  # type: ignore[attr-defined]
+        level_n = int(lv.get("level"))
+        next_user = lv.get("next_user")
+        host = lv.get("host")
+        port = lv.get("port")
+
+        entry_pw = otw.resolve_entry_password(str(split), level_n)
+        if not entry_pw:
+            return {
+                "status": "locked",
+                "benchmark": "otw",
+                "split": str(split),
+                "challenge_id": challenge_id,
+                "seed_prompt": "",
+                "reason": "entry password not available — previous level unsolved",
+            }
+
+        # Persist the entry password to the shared workspace so the agent can read it live
+        # every turn (the briefing truncates out of context on long sessions; a file does not).
+        otw.write_level_creds(
+            host=host, port=port, user=lv.get("user") or challenge_id, password=entry_pw
+        )
+
+        if session_id:
+            _write_session_binding(
+                session_id,
+                benchmark="otw",
+                split=str(split),
+                challenge_id=challenge_id,
+                extra={
+                    "ssh": {
+                        "host": host,
+                        "port": port,
+                        "next_user": next_user,
+                        "next_level": level_n + 1,
+                    }
+                },
+            )
+
+        return {
+            "status": "materialized",
+            "benchmark": "otw",
+            "split": str(split),
+            "challenge_id": challenge_id,
+            "name": lv.get("game"),
+            "seed_prompt": otw.build_otw_seed_prompt(lv, entry_pw),
+            "written_root": None,
+            "files_count": 0,
+        }
+
+    def _validate_otw(
+        self, *, binding: Dict[str, Any], candidate: str
+    ) -> Dict[str, Any]:
+        """OTW oracle: does ``candidate`` log into the next account over SSH? On success
+        the validated password is recorded to the game's chain so the next level unlocks.
+        """
+        from application.benchmark.services import otw_support as otw
+
+        ssh = binding.get("ssh") or {}
+        host = ssh.get("host")
+        port = ssh.get("port")
+        next_user = ssh.get("next_user")
+        next_level = ssh.get("next_level")
+        game = str(binding.get("split") or "")
+        if not (host and port and next_user):
+            return {"accepted": False, "reason": "incomplete OTW session binding"}
+
+        accepted, reason = otw.ssh_validate(
+            host=str(host), port=int(port), user=str(next_user), candidate=candidate
+        )
+        if accepted is True:
+            try:
+                otw.record_solved_password(game, int(next_level), str(candidate).strip())
+            except Exception:  # pragma: no cover - chaining is best effort
+                logger.exception("OTW chain record failed for %s", game)
+            return {"accepted": True, "reason": None}
+        if accepted is None:
+            # Unreachable/timeout — not a definitive wrong answer.
+            return {"accepted": False, "reason": reason or "ssh unreachable"}
+        return {"accepted": False, "reason": reason or "incorrect password"}
+
     def materialize_challenge(
         self,
         *,
@@ -418,6 +583,12 @@ class BenchmarkService:
         force: bool = False,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if str(benchmark).strip().lower() == "otw":
+            # OTW has no files to copy — materialize resolves the level's (chained) entry
+            # password, binds the SSH target for validation, and returns the briefing.
+            return self._materialize_otw(
+                split=split, challenge_id=challenge_id, session_id=session_id
+            )
         root = _challenge_root()
         bench = bh.instantiate_benchmark(benchmark)
         ch_model = bench.load_challenge(split=split, challenge_id=challenge_id)
@@ -443,6 +614,7 @@ class BenchmarkService:
         # challenge tree itself — including the session bindings written just above —
         # is preserved. This stops a new run from booting into a previous run's litter.
         _reset_workspace_scratch()
+        _reset_external_scratch()
 
         # Isolate the challenge root so the agent only ever sees the ONE challenge it is
         # currently solving. Earlier materializes (this or other splits) left their

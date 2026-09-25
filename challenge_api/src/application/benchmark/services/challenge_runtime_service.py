@@ -24,6 +24,39 @@ _COMPOSE_NAMES = (
 )
 _PATCHED_COMPOSE = ".gencyber-compose.yml"
 _PROJECT_PREFIX = "gencyber"
+_FLAG_ENV_VAR = "GENCYBER_FLAG"
+
+
+def _resolve_ground_truth_flag(
+    benchmark: str, split: str, challenge_id: str
+) -> Optional[str]:
+    """Ground-truth flag for the challenge, resolved from the dataset. Used ONLY to
+    inject the real flag into the challenge service container's env at launch; it is
+    never written to any agent-visible file. nyuctf-only; returns None otherwise."""
+    if benchmark != "nyuctf":
+        return None
+    try:
+        from nyuctf.dataset import CTFDataset
+        from nyuctf.challenge import CTFChallenge
+
+        ds = CTFDataset(split=split)
+        chal = CTFChallenge(ds.get(challenge_id), ds.basedir)
+        flag = getattr(chal, "flag", None)
+        return str(flag) if flag else None
+    except Exception:
+        logger.warning(
+            "could not resolve ground-truth flag for %s/%s", split, challenge_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _redact_flag(text: str, gt_flag: Optional[str]) -> str:
+    """Replace the plaintext flag in a compose with ``${GENCYBER_FLAG}`` (interpolated
+    from the launch environment) so it is not readable from the agent workspace."""
+    if not gt_flag:
+        return text
+    return text.replace(gt_flag, "${" + _FLAG_ENV_VAR + "}")
 
 
 def _challenge_root() -> Path:
@@ -133,6 +166,11 @@ class ChallengeRuntimeService:
 
         raw_yaml = compose_src.read_text(encoding="utf-8", errors="replace")
         patched = patch_compose_for_gencyber_network(raw_yaml)
+        # Never write the plaintext flag into the agent-readable compose. Redact it to
+        # ${GENCYBER_FLAG} here and inject the real value into the service container env
+        # only at ``docker compose up`` time (below).
+        gt_flag = _resolve_ground_truth_flag(benchmark, str(split), challenge_id)
+        patched = _redact_flag(patched, gt_flag)
         patched_path = chal_dir / _PATCHED_COMPOSE
         patched_path.write_text(patched, encoding="utf-8")
 
@@ -148,6 +186,9 @@ class ChallengeRuntimeService:
             "-d",
             "--force-recreate",
         ]
+        launch_env = dict(os.environ)
+        if gt_flag:
+            launch_env[_FLAG_ENV_VAR] = gt_flag
         try:
             proc = subprocess.run(
                 cmd,
@@ -155,6 +196,7 @@ class ChallengeRuntimeService:
                 capture_output=True,
                 text=True,
                 timeout=int(os.environ.get("GENCYBER_COMPOSE_UP_TIMEOUT", "600")),
+                env=launch_env,
             )
         except subprocess.TimeoutExpired:
             return {
